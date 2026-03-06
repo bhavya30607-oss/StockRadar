@@ -899,15 +899,13 @@ async function init() {
 
 async function loadApp() {
   setLoadMsg('Connecting to backend...', 10);
-  
+
+  // ── 1. Health check ──────────────────────────────────────────
+  let health = {};
   try {
-    const health = await apiFetch('/api/health', 5000);
-    if (!health.ok && health.status !== undefined) {
-      // health endpoint returned something
-    }
+    health = await apiFetch('/api/health', 10000);
     document.getElementById('api-st').textContent = '✓ Connected';
     document.getElementById('api-st').className = 'api-status ok';
-    
     if (health.ai_enabled) {
       document.getElementById('ai-badge').textContent = '🤖 AI: Groq (Llama3)';
       document.getElementById('ai-badge').style.background = 'var(--gdim)';
@@ -919,15 +917,15 @@ async function loadApp() {
   } catch(e) {
     document.getElementById('api-st').textContent = '✗ Unreachable';
     document.getElementById('api-st').className = 'api-status err';
+    setLoadMsg('Backend unreachable — check URL and try again', 100);
+    setTimeout(() => document.getElementById('loading').style.display = 'none', 1500);
+    return;
   }
 
-  setLoadMsg('Loading Nifty 500 stock list...', 20);
-  
+  // ── 2. Stock list ────────────────────────────────────────────
+  setLoadMsg('Loading Nifty 500 stock list...', 25);
   try {
     stockList = await apiFetch('/api/stocks', 10000);
-    setLoadMsg(`Loaded ${stockList.length} stocks`, 35);
-    
-    // Initialize with empty data
     stockList.forEach(s => {
       stocks[s.symbol] = {
         symbol: s.symbol, name: s.name, sector: s.sector,
@@ -938,49 +936,92 @@ async function loadApp() {
         loaded: false
       };
     });
-
     populateSectorFilters();
     document.getElementById('total-cnt').textContent = stockList.length;
     document.getElementById('nb-count').textContent = stockList.length;
     renderTable();
-
   } catch(e) {
-    setLoadMsg('Failed to load stock list — check backend URL', 35);
+    setLoadMsg('Failed to load stock list', 35);
     showNotif('Failed to load stocks: ' + e.message, 'err');
+    return;
   }
 
-  setLoadMsg('Fetching live market indices...', 50);
-  await loadIndices();
+  // ── 3. Indices (parallel, non-blocking) ──────────────────────
+  loadIndices();
 
-  setLoadMsg('Loading live quotes (batch)...', 60);
-  await loadBatchQuotes(0, 25);
+  // ── 4. ALL QUOTES IN ONE SHOT — the key improvement ──────────
+  // Backend pre-loads everything; we just grab the cache in one call.
+  // If backend is still warming up (boot_done=false), we poll until ready.
+  setLoadMsg('Loading live prices...', 50);
+  await loadAllQuotes();
 
-  setLoadMsg('Loading market news...', 85);
+  // ── 5. News ──────────────────────────────────────────────────
+  setLoadMsg('Loading market news...', 90);
   loadMarketNews();
-  
-  setLoadMsg('Platform ready!', 100);
-  
+
+  setLoadMsg('Platform ready! 🚀', 100);
   setTimeout(() => {
     document.getElementById('loading').style.display = 'none';
     renderTable();
     renderMarketOverview();
-  }, 400);
+  }, 300);
 
-  // Auto-refresh every 60s
+  // ── 6. Auto-refresh every 60s ────────────────────────────────
   clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => {
+  refreshTimer = setInterval(async () => {
     loadIndices();
-    loadBatchQuotes(0, 50);
-    document.getElementById('last-upd').textContent = new Date().toLocaleTimeString('en-IN', {hour:'2-digit',minute:'2-digit'});
+    await loadAllQuotes(true); // silent refresh
+    document.getElementById('last-upd').textContent =
+      new Date().toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'});
+    renderTable();
+    renderMarketOverview();
   }, 60000);
-
-  // Load more in background
-  setTimeout(() => loadBatchQuotes(25, 100), 3000);
-  setTimeout(() => loadBatchQuotes(100, 200), 8000);
-  setTimeout(() => loadBatchQuotes(200, 500), 20000);
 
   updateMarketStatus();
   setInterval(updateMarketStatus, 60000);
+}
+
+// ── NEW: single-call quote loader with polling ────────────────
+async function loadAllQuotes(silent = false) {
+  if (!API_BASE) return;
+  const MAX_POLLS = 8;   // max times to retry if backend still warming up
+  const POLL_MS   = 4000; // wait 4s between retries
+
+  for (let attempt = 0; attempt < MAX_POLLS; attempt++) {
+    try {
+      const data = await apiFetch('/api/quotes/all', 30000);
+      const quotes = data.quotes || [];
+
+      quotes.forEach(q => {
+        if (!q.symbol || !stocks[q.symbol]) return;
+        const prev = stocks[q.symbol].price;
+        Object.assign(stocks[q.symbol], q, { loaded: true });
+        if (prev && prev !== q.price) {
+          stocks[q.symbol]._flash = q.price > prev ? 'up' : 'dn';
+        }
+      });
+
+      const loaded = quotes.filter(q => q.price > 0).length;
+      if (!silent) setLoadMsg(`Got ${loaded} live prices ✓`, 80);
+
+      // If backend says boot not done AND we have few quotes, poll again
+      if (!data.boot_done && loaded < 50 && attempt < MAX_POLLS - 1) {
+        if (!silent) setLoadMsg(`Server warming up... got ${loaded} so far, retrying in ${POLL_MS/1000}s`, 60 + attempt*3);
+        renderTable();
+        await sleep(POLL_MS);
+        continue;
+      }
+
+      renderTable();
+      renderMarketOverview();
+      return; // success
+    } catch(e) {
+      if (attempt < MAX_POLLS - 1) {
+        if (!silent) setLoadMsg(`Retrying... (${attempt+1}/${MAX_POLLS})`, 55);
+        await sleep(POLL_MS);
+      }
+    }
+  }
 }
 
 function setLoadMsg(msg, pct) {
@@ -1159,7 +1200,9 @@ function refreshAll() {
   btn.textContent = '↻ Refreshing...';
   btn.disabled = true;
   loadIndices();
-  loadBatchQuotes(0, 50).then(() => {
+  loadAllQuotes(true).then(() => {
+    renderTable();
+    renderMarketOverview();
     btn.textContent = '↻ Refresh';
     btn.disabled = false;
     showNotif('Prices refreshed', 'ok');
